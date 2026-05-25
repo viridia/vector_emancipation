@@ -3,6 +3,7 @@ use bevy::{
     prelude::*,
     render::mesh::{Indices, PrimitiveTopology},
 };
+use std::collections::VecDeque;
 use std::f32::consts::TAU;
 
 const WINDOW_SIZE: u32 = 640;
@@ -203,7 +204,7 @@ struct GridDot {
 // ── Arrow mesh building ───────────────────────────────────────────────────────────
 
 /// Arrow body half-width as a fraction of `cell_size`.
-const ARROW_HALF_WIDTH_FRAC: f32 = 0.14;
+const ARROW_HALF_WIDTH_FRAC: f32 = 0.10;
 /// Arrowhead length (base to tip) as a fraction of `cell_size`.
 const ARROWHEAD_LENGTH_FRAC: f32 = 0.55;
 /// Arrowhead base half-width as a fraction of `cell_size`.
@@ -460,13 +461,23 @@ struct ArrowSpec {
     hue: f32,
 }
 
-/// Maximum distance (in cells) from a board-edge cell to its arrowhead.
-const MAX_HEAD_DEPTH: i32 = 4;
-/// Maximum number of axis-aligned segments per arrow tail.
-const MAX_SEGMENTS: i32 = 4;
-/// Inclusive bounds on a single tail segment's length (in cells).
-const MIN_SEG_LEN: i32 = 1;
-const MAX_SEG_LEN: i32 = 5;
+/// Cardinal-direction unit vectors used by the BFS tail finder.
+const CARDINALS: [IVec2; 4] = [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y];
+
+/// Returns the BFS-target sampling knobs `(min_depth, bias_power)` for the
+/// `placed_count`-th arrow produced by `generate_level`. The earliest
+/// placements end up being the *last* arrows the player solves (reverse-
+/// order generation), so they get the most aggressive long-tail bias —
+/// these are the sprawling "trunk" arrows. Targets relax as the board
+/// fills, so later placements settle for whatever fits in the gaps.
+fn target_constraints(placed_count: usize) -> (u16, i32) {
+    match placed_count {
+        0..=2 => (8, 4),
+        3..=6 => (4, 3),
+        7..=15 => (3, 2),
+        _ => (2, 1),
+    }
+}
 
 /// Tiny seeded RNG built on `hash_u32`. Deterministic per seed and produces
 /// reasonable-quality output for level generation — not for cryptography.
@@ -479,14 +490,6 @@ impl Rng {
     fn next_u32(&mut self) -> u32 {
         self.0 = hash_u32(self.0.wrapping_add(0x9E3779B9));
         self.0
-    }
-    /// Returns a uniform integer in `[lo, hi]` (both inclusive).
-    fn range(&mut self, lo: i32, hi: i32) -> i32 {
-        let span = (hi - lo + 1) as u32;
-        lo + (self.next_u32() % span) as i32
-    }
-    fn bool(&mut self) -> bool {
-        self.next_u32() & 1 == 0
     }
     /// Returns a uniform `f32` in `[0, 1)`.
     fn f32_unit(&mut self) -> f32 {
@@ -509,18 +512,6 @@ fn cell_index(p: IVec2, cols: i32) -> usize {
 #[inline]
 fn in_bounds(p: IVec2, cols: i32, rows: i32) -> bool {
     p.x >= 0 && p.y >= 0 && p.x < cols && p.y < rows
-}
-
-/// Rotate a cardinal direction 90° CCW (player's left when facing `d`).
-#[inline]
-fn turn_left(d: IVec2) -> IVec2 {
-    IVec2::new(-d.y, d.x)
-}
-
-/// Rotate a cardinal direction 90° CW (player's right when facing `d`).
-#[inline]
-fn turn_right(d: IVec2) -> IVec2 {
-    IVec2::new(d.y, -d.x)
 }
 
 /// Mark every cell on the axis-aligned segment `a → b` as occupied.
@@ -568,10 +559,15 @@ fn generate_level(cols: i32, rows: i32, seed: u32) -> Vec<ArrowSpec> {
     }
     rng.shuffle(&mut outlets);
 
+    // Arrowheads may sit anywhere from 1 cell to `max_depth` cells inside
+    // the board along the line running away from the outlet. The cap is the
+    // longest run the corridor could possibly span.
+    let max_depth = cols.max(rows) - 1;
+
     for (edge_cell, inward) in outlets {
         // Arrowhead's slide direction is outward (toward the edge cell).
         let head_dir = -inward;
-        let mut depths: Vec<i32> = (1..=MAX_HEAD_DEPTH).collect();
+        let mut depths: Vec<i32> = (1..=max_depth).collect();
         rng.shuffle(&mut depths);
 
         for depth in depths {
@@ -603,8 +599,10 @@ fn generate_level(cols: i32, rows: i32, seed: u32) -> Vec<ArrowSpec> {
                 step += head_dir;
             }
 
+            let (min_depth, bias_power) = target_constraints(placed.len());
             if let Some(verts) = try_place_arrow(
-                cols, rows, &occupied, &corridor, arrowhead, head_dir, &mut rng,
+                cols, rows, &occupied, &corridor, arrowhead, head_dir, min_depth, bias_power,
+                &mut rng,
             ) {
                 for win in verts.windows(2) {
                     mark_segment_occupied(&mut occupied, cols, win[0], win[1]);
@@ -624,10 +622,13 @@ fn generate_level(cols: i32, rows: i32, seed: u32) -> Vec<ArrowSpec> {
     placed
 }
 
-/// Random-walks a tail backward from `arrowhead` and assembles the arrow's
-/// vertex list. Returns `Some([tail_end, …corners…, arrowhead])` on success
-/// (at least one tail cell beyond the arrowhead), or `None` if the first
-/// step is already blocked.
+/// BFS-based tail finder. Maps reachability from `arrowhead` through free
+/// non-corridor cells (recording per-cell parent direction, depth, and
+/// running bend count), samples a target weighted toward long-and-winding
+/// paths, then traces back to assemble the arrow's vertex list.
+///
+/// Returns `Some([tail_end, …corners…, arrowhead])` on success, or `None`
+/// if no reachable cell satisfies `min_depth`.
 fn try_place_arrow(
     cols: i32,
     rows: i32,
@@ -635,58 +636,108 @@ fn try_place_arrow(
     corridor: &[bool],
     arrowhead: IVec2,
     head_dir: IVec2,
+    min_depth: u16,
+    bias_power: i32,
     rng: &mut Rng,
 ) -> Option<Vec<IVec2>> {
-    // Self-avoidance mask: the tail must not revisit its own cells.
-    let mut visited = vec![false; (cols * rows) as usize];
-    visited[cell_index(arrowhead, cols)] = true;
+    let n = (cols * rows) as usize;
+    // (parent_dir, depth, bends_to_here). `parent_dir` points from this
+    // cell to its parent — trace back via `cur += parent_dir`.
+    let mut visited: Vec<Option<(IVec2, u16, u16)>> = vec![None; n];
+    visited[cell_index(arrowhead, cols)] = Some((IVec2::ZERO, 0, 0));
 
-    // End of each completed segment, in order moving outward from the arrowhead.
-    let mut segment_ends: Vec<IVec2> = Vec::new();
-    let mut cur = arrowhead;
-    let mut dir = -head_dir;
+    // Force the first step opposite `head_dir` so the arrowhead's final
+    // segment matches the slide direction.
+    let first = arrowhead - head_dir;
+    if !in_bounds(first, cols, rows) {
+        return None;
+    }
+    let i_first = cell_index(first, cols);
+    if occupied[i_first] || corridor[i_first] {
+        return None;
+    }
+    visited[i_first] = Some((head_dir, 1, 0));
 
-    let num_segments = rng.range(1, MAX_SEGMENTS);
-    for _ in 0..num_segments {
-        let target = rng.range(MIN_SEG_LEN, MAX_SEG_LEN);
-        let mut steps = 0;
-        for _ in 0..target {
-            let next = cur + dir;
+    let mut frontier: VecDeque<IVec2> = VecDeque::new();
+    frontier.push_back(first);
+
+    while let Some(cell) = frontier.pop_front() {
+        let (parent_dir, depth, bends) = visited[cell_index(cell, cols)].unwrap();
+        // The direction we were moving when we arrived at `cell`.
+        let incoming = -parent_dir;
+        let mut dirs = CARDINALS;
+        rng.shuffle(&mut dirs);
+        for d in dirs {
+            let next = cell + d;
             if !in_bounds(next, cols, rows) {
-                break;
+                continue;
             }
             let i = cell_index(next, cols);
-            if occupied[i] || corridor[i] || visited[i] {
-                break;
+            if visited[i].is_some() || occupied[i] || corridor[i] {
+                continue;
             }
-            visited[i] = true;
-            cur = next;
-            steps += 1;
+            let bend_inc: u16 = if d != incoming { 1 } else { 0 };
+            visited[i] = Some((-d, depth + 1, bends + bend_inc));
+            frontier.push_back(next);
         }
-        if steps == 0 {
-            break;
-        }
-        segment_ends.push(cur);
-        if steps < target {
-            break; // segment cut short — accept what we have, don't continue
-        }
-        dir = if rng.bool() {
-            turn_left(dir)
-        } else {
-            turn_right(dir)
-        };
     }
 
-    if segment_ends.is_empty() {
+    // Weighted target sampling: weight = depth^bias_power × (1 + bends).
+    let mut weights: Vec<(IVec2, f32)> = Vec::new();
+    let mut total: f32 = 0.0;
+    for r in 0..rows {
+        for c in 0..cols {
+            let p = IVec2::new(c, r);
+            if let Some((_, depth, bends)) = visited[cell_index(p, cols)]
+                && depth >= min_depth
+            {
+                let w = (depth as f32).powi(bias_power) * (1.0 + bends as f32);
+                total += w;
+                weights.push((p, w));
+            }
+        }
+    }
+    if weights.is_empty() {
+        return None;
+    }
+    let mut pick = rng.f32_unit() * total;
+    let mut target = weights[0].0;
+    for (p, w) in &weights {
+        if pick <= *w {
+            target = *p;
+            break;
+        }
+        pick -= *w;
+    }
+
+    // Trace back from target to arrowhead via parent_dir.
+    let mut path: Vec<IVec2> = vec![target];
+    let mut cur = target;
+    loop {
+        let (parent_dir, depth, _) = visited[cell_index(cur, cols)].unwrap();
+        if depth == 0 {
+            break;
+        }
+        cur += parent_dir;
+        path.push(cur);
+    }
+    let n_path = path.len();
+    if n_path < 2 {
         return None;
     }
 
-    // Reverse so vertices read tail-end → corners → arrowhead.
-    let mut vertices = Vec::with_capacity(segment_ends.len() + 1);
-    for p in segment_ends.iter().rev() {
-        vertices.push(*p);
+    // Collapse collinear runs into vertices. `path[0]` is the tail end and
+    // `path[n_path - 1]` is the arrowhead.
+    let mut vertices: Vec<IVec2> = Vec::with_capacity(n_path);
+    vertices.push(path[0]);
+    for i in 1..n_path - 1 {
+        let prev_dir = path[i] - path[i - 1];
+        let next_dir = path[i + 1] - path[i];
+        if prev_dir != next_dir {
+            vertices.push(path[i]);
+        }
     }
-    vertices.push(arrowhead);
+    vertices.push(path[n_path - 1]);
     Some(vertices)
 }
 
