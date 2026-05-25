@@ -14,7 +14,9 @@ const GRID_AVAILABLE_X: f32 = 480.0;
 const GRID_AVAILABLE_Y: f32 = 480.0;
 const MIN_GRID_DIM: i32 = 10;
 const MAX_GRID_DIM: i32 = 40;
-const DOT_RADIUS: f32 = 2.0;
+/// Dot radius as a fraction of `cell_size`. Keeps dots proportional to arrows
+/// so small cells on large grids still look right.
+const DOT_RADIUS_FRAC: f32 = 0.06;
 const BACKGROUND_COLOR: Color = Color::srgb(0.08, 0.08, 0.12);
 const DOT_COLOR: Color = Color::srgb(0.35, 0.35, 0.45);
 
@@ -818,7 +820,8 @@ fn setup_playfield(
     let (cols, rows) = level_grid_size(level.0);
     let cell_size = cell_size_for_grid(cols, rows);
 
-    let dot_mesh = meshes.add(Circle::new(DOT_RADIUS));
+    let dot_radius = (cell_size * DOT_RADIUS_FRAC).max(1.0);
+    let dot_mesh = meshes.add(Circle::new(dot_radius));
     let dot_material = materials.add(ColorMaterial::from(DOT_COLOR));
 
     // Round offsets to whole pixels so every dot lands on a pixel boundary.
