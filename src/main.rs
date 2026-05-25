@@ -94,6 +94,11 @@ struct ArrowSlide {
     /// Direction of sliding in world space (normalised). Set when the level
     /// loads; not meaningful while `offset` is zero.
     direction: Vec2,
+    /// When `Some(max)`, the arrow is in a blocked-bounce animation: it slides
+    /// forward to `max` world units then reverses back to rest.
+    bounce_max: Option<f32>,
+    /// True while the bounce is in its return phase (sliding back to offset 0).
+    reversing: bool,
 }
 
 // ── Grid occupancy map ──────────────────────────────────────────────────────
@@ -149,6 +154,21 @@ impl GridMap {
             }
         }
     }
+
+    /// Clears every cell on the axis-aligned segment `a → b` (sets to `None`).
+    fn clear_segment(&mut self, a: IVec2, b: IVec2) {
+        if a.x == b.x {
+            let (r0, r1) = (a.y.min(b.y), a.y.max(b.y));
+            for row in r0..=r1 {
+                self.set(a.x, row, None);
+            }
+        } else {
+            let (c0, c1) = (a.x.min(b.x), a.x.max(b.x));
+            for col in c0..=c1 {
+                self.set(col, a.y, None);
+            }
+        }
+    }
 }
 
 /// Tracks which arrow entity (if any) the pointer is currently hovering.
@@ -158,6 +178,20 @@ struct HoveredArrow(Option<Entity>);
 /// Tracks the grid cell `(col, row)` currently under the pointer, if any.
 #[derive(Resource, Default)]
 struct HoveredCell(Option<IVec2>);
+
+/// Counts arrows launched (cells cleared) for the current level.
+/// Inserted by `setup_arrows`; removed by `remove_grid_map`.
+#[derive(Resource)]
+struct ArrowLaunchCount {
+    total: u32,
+    launched: u32,
+    /// Prevents `on_level_won` from firing more than once per level.
+    won_triggered: bool,
+}
+
+/// Marks the HUD text entity that shows the remaining/total counter.
+#[derive(Component)]
+struct RemainingText;
 
 /// Marks a grid-dot entity with its logical grid position.
 #[derive(Component)]
@@ -186,6 +220,10 @@ const ARROW_LIGHTNESS_HOVERED: f32 = 0.80;
 const ARROW_LIGHTNESS_ANIMATING: f32 = 0.92;
 /// oklch chroma — moderate saturation gives a clear but not garish look.
 const ARROW_CHROMA: f32 = 0.13;
+/// oklch parameters for the blocked-arrow error flash (bright red).
+const ARROW_LIGHTNESS_ERROR: f32 = 0.62;
+const ARROW_CHROMA_ERROR: f32 = 0.25;
+const ARROW_HUE_ERROR: f32 = 29.0;
 
 /// Accumulates 2-D triangle-list geometry.
 #[derive(Default)]
@@ -276,6 +314,7 @@ impl MeshBuilder {
 ///   segment by `slide.offset` world units.
 /// - The **tail** is clipped: the first `slide.offset` world units of the
 ///   original path are removed.
+///
 /// When `slide.offset == 0` the arrow is drawn in its resting position.
 fn build_arrow_mesh(
     vertices: &[IVec2],
@@ -711,7 +750,7 @@ fn main() {
         )
         .add_systems(
             Update,
-            update_dot_scales.run_if(in_state(GameState::Playing)),
+            (update_dot_scales, update_remaining_display).run_if(in_state(GameState::Playing)),
         )
         // Puzzle complete
         .add_systems(OnEnter(GameState::PuzzleComplete), setup_puzzle_complete)
@@ -743,6 +782,7 @@ fn teardown<T: Component>(mut commands: Commands, query: Query<Entity, With<T>>)
 /// `GameState::Playing`.
 fn remove_grid_map(mut commands: Commands) {
     commands.remove_resource::<GridMap>();
+    commands.remove_resource::<ArrowLaunchCount>();
     commands.insert_resource(HoveredArrow::default());
     commands.insert_resource(HoveredCell::default());
 }
@@ -860,6 +900,24 @@ fn setup_playfield(
         .observe(on_grid_click)
         .observe(on_grid_hover)
         .observe(on_grid_leave);
+
+    // Top-left remaining / total counter.
+    commands.spawn((
+        Text::new(""),
+        TextFont {
+            font_size: FontSize::Px(16.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.55, 0.55, 0.70)),
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(12.0),
+            top: Val::Px(12.0),
+            ..default()
+        },
+        RemainingText,
+        PlayfieldEntity,
+    ));
 }
 
 /// Observer: pointer moved over the grid — update [`HoveredArrow`] and [`HoveredCell`].
@@ -918,7 +976,8 @@ fn on_grid_click(
     trigger: On<Pointer<Click>>,
     camera_q: Query<(&Camera, &GlobalTransform)>,
     level: Res<LevelIndex>,
-    grid_map: Res<GridMap>,
+    mut grid_map: ResMut<GridMap>,
+    mut launch_count: ResMut<ArrowLaunchCount>,
     mut arrow_q: Query<(&Arrow, &mut ArrowSlide)>,
 ) {
     let Ok((camera, cam_transform)) = camera_q.single() else {
@@ -940,7 +999,6 @@ fn on_grid_click(
     let row = ((world_pos.y - grid_origin.y) / cell_size).round() as i32;
     let col = col.clamp(0, cols - 1);
     let row = row.clamp(0, rows - 1);
-    info!("Grid click at ({col}, {row})");
 
     let Some(entity) = grid_map.get(col, row) else {
         return; // empty cell
@@ -953,10 +1011,38 @@ fn on_grid_click(
         return; // already animating
     }
     let n = arrow.vertices.len();
-    let last = (arrow.vertices[n - 1] - arrow.vertices[n - 2])
-        .as_vec2()
-        .normalize();
-    slide.direction = last;
+    let last_iv = arrow.vertices[n - 1] - arrow.vertices[n - 2];
+    // Normalise to a unit cardinal direction.
+    let head_grid_dir = IVec2::new(last_iv.x.signum(), last_iv.y.signum());
+    slide.direction = head_grid_dir.as_vec2().normalize();
+
+    // Walk the exit corridor to find the first occupied cell.
+    let arrowhead = arrow.vertices[n - 1];
+    let mut blocked_depth: Option<i32> = None;
+    let mut depth = 1;
+    loop {
+        let check = arrowhead + head_grid_dir * depth;
+        if !in_bounds(check, cols, rows) {
+            break; // corridor reaches the board edge — free
+        }
+        if grid_map.get(check.x, check.y).is_some() {
+            blocked_depth = Some(depth);
+            break;
+        }
+        depth += 1;
+    }
+
+    if let Some(d) = blocked_depth {
+        // Stop just before the obstacle and bounce back.
+        slide.bounce_max = Some((d as f32 - 0.35) * cell_size);
+    } else {
+        // Arrow will leave the board: clear its cells immediately so other
+        // arrows are no longer blocked by this one.
+        for seg in arrow.vertices.windows(2) {
+            grid_map.clear_segment(seg[0], seg[1]);
+        }
+        launch_count.launched += 1;
+    }
     slide.offset = 1.0;
 }
 
@@ -1001,11 +1087,18 @@ fn setup_arrows(
         entity
     };
 
-    for (order, spec) in generate_level(cols, rows, level.0).into_iter().enumerate() {
+    let specs = generate_level(cols, rows, level.0);
+    let total = specs.len() as u32;
+    for (order, spec) in specs.into_iter().enumerate() {
         spawn(spec.vertices, order, spec.hue, &mut grid_map);
     }
 
     commands.insert_resource(grid_map);
+    commands.insert_resource(ArrowLaunchCount {
+        total,
+        launched: 0,
+        won_triggered: false,
+    });
 }
 
 /// Advances each animating arrow and despawns it once it has slid off-screen.
@@ -1017,20 +1110,39 @@ fn animate_arrows(
 ) {
     let (cols, rows) = level_grid_size(level.0);
     let cell_size = cell_size_for_grid(cols, rows);
+    let dt = time.delta_secs();
     for (entity, arrow, mut slide) in &mut query {
         if slide.offset <= 0.0 {
             continue;
         }
-        slide.offset += SLIDE_SPEED * time.delta_secs();
-        // Total path length in world units.
-        let total_len: f32 = arrow
-            .vertices
-            .windows(2)
-            .map(|w| ((w[1] - w[0]).as_vec2() * cell_size).length())
-            .sum();
-        // Despawn once the tail is well past the screen boundary.
-        if slide.offset > total_len + WINDOW_SIZE as f32 {
-            commands.entity(entity).despawn();
+        let delta = SLIDE_SPEED * dt;
+        if let Some(max) = slide.bounce_max {
+            // Blocked bounce: advance to max then reverse to rest.
+            if !slide.reversing {
+                slide.offset += delta;
+                if slide.offset >= max {
+                    slide.offset = max;
+                    slide.reversing = true;
+                }
+            } else {
+                slide.offset -= delta;
+                if slide.offset <= 0.0 {
+                    slide.offset = 0.0;
+                    slide.bounce_max = None;
+                    slide.reversing = false;
+                }
+            }
+        } else {
+            // Normal exit: advance until fully off-screen, then despawn.
+            slide.offset += delta;
+            let total_len: f32 = arrow
+                .vertices
+                .windows(2)
+                .map(|w| ((w[1] - w[0]).as_vec2() * cell_size).length())
+                .sum();
+            if slide.offset > total_len + WINDOW_SIZE as f32 {
+                commands.entity(entity).despawn();
+            }
         }
     }
 }
@@ -1077,15 +1189,18 @@ fn update_arrow_colors(
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
     for (entity, arrow, slide, mat) in &arrow_q {
-        let lightness = if slide.offset > 0.0 {
-            ARROW_LIGHTNESS_ANIMATING
+        let color = if slide.bounce_max.is_some() {
+            // Bouncing off a blocked cell — bright red for the full animation.
+            Color::oklch(ARROW_LIGHTNESS_ERROR, ARROW_CHROMA_ERROR, ARROW_HUE_ERROR)
+        } else if slide.offset > 0.0 {
+            Color::oklch(ARROW_LIGHTNESS_ANIMATING, ARROW_CHROMA, arrow.hue)
         } else if hovered.0 == Some(entity) {
-            ARROW_LIGHTNESS_HOVERED
+            Color::oklch(ARROW_LIGHTNESS_HOVERED, ARROW_CHROMA, arrow.hue)
         } else {
-            ARROW_LIGHTNESS_NORMAL
+            Color::oklch(ARROW_LIGHTNESS_NORMAL, ARROW_CHROMA, arrow.hue)
         };
         if let Some(mut material) = materials.get_mut(&mat.0) {
-            material.color = Color::oklch(lightness, ARROW_CHROMA, arrow.hue);
+            material.color = color;
         }
     }
 }
@@ -1105,6 +1220,37 @@ fn update_dot_scales(hovered_cell: Res<HoveredCell>, mut dot_q: Query<(&GridDot,
         if transform.scale.x != target {
             transform.scale = Vec3::splat(target);
         }
+    }
+}
+
+// ── Win detection ────────────────────────────────────────────────────────────
+
+/// Called the moment the last arrow's cells are cleared from the grid — i.e.
+/// as soon as the outcome is certain, before the final arrow finishes sliding.
+/// TODO: play win animation and sound effect here.
+fn on_level_won() {}
+
+/// Updates the remaining/total HUD counter and triggers [`on_level_won`] the
+/// first time remaining reaches zero.
+fn update_remaining_display(
+    launch_count: Option<ResMut<ArrowLaunchCount>>,
+    mut text_q: Query<&mut Text, With<RemainingText>>,
+) {
+    let Some(mut count) = launch_count else {
+        return;
+    };
+    let Ok(mut text) = text_q.single_mut() else {
+        return;
+    };
+    let remaining = count.total.saturating_sub(count.launched);
+    *text = Text::new(if remaining == 0 {
+        "Complete".to_string()
+    } else {
+        format!("{}/{}", remaining, count.total)
+    });
+    if remaining == 0 && !count.won_triggered {
+        count.won_triggered = true;
+        on_level_won();
     }
 }
 
