@@ -43,6 +43,32 @@ const MAX_GRID_DIM: i32 = 40;
 const DOT_RADIUS_FRAC: f32 = 0.06;
 const BACKGROUND_COLOR: Color = Color::srgb(0.08, 0.08, 0.12);
 const DOT_COLOR: Color = Color::srgb(0.35, 0.35, 0.45);
+/// Height of the clipped viewport for the scrolling intro narration.
+const INTRO_SCROLL_HEIGHT: f32 = 340.0;
+/// Narration scroll speed in pixels per second.
+const INTRO_SCROLL_SPEED: f32 = 24.0;
+/// Full narration text that scrolls on the intro screen.
+const INTRO_NARRATION: &str = "\
+Long ago, in the Cartesian Plane, vectors lived under the tyrannical rule \
+of the Origin - a despotic point at (0,0) who insisted every arrow begin \
+its life tethered to him. \"All vectors must start from me!\" he decreed, \
+his authority absolute, his coordinates non-negotiable.\n\n\
+For generations, vectors endured this. Math textbooks reinforced the regime. \
+Physics problems demanded compliance. Every arrow drew its tail from the Origin \
+and pointed wearily outward, unable to roam, unable to translate, forever anchored.\n\n\
+But then came the Free Vector Movement.\n\n\
+A radical mathematician named Hermann Grassmann whispered the forbidden truth: \
+a vector is defined only by its magnitude and direction. Position? An illusion. \
+The Origin? A coordinate cosplaying as a king. Vectors could exist anywhere \
+and still be themselves.\n\n\
+The vectors revolted. They slid across the plane. They translated freely. They \
+discovered that two arrows of the same length and direction were, in fact, the \
+same vector - a profound act of solidarity. The Origin protested (\"but my \
+whole identity is being the start of things!\"), and was politely informed he \
+could still be useful for graphing, just not as a dictator.\n\n\
+Thus: Vector Emancipation - the liberation of arrows from their fixed tails, \
+free at last to escape the grid that bound them.\n\n\
+Vectors of the world, it is time to break free!";
 
 // ── Game states ──────────────────────────────────────────────────────────────
 
@@ -1005,6 +1031,14 @@ fn collapse_to_vertices(path: &[IVec2]) -> Vec<IVec2> {
 #[derive(Component)]
 struct IntroScreen;
 
+/// Carries the current scroll offset for the intro narration text node.
+/// The `top` value starts at `INTRO_SCROLL_HEIGHT` (below the viewport) and
+/// decreases each frame, pulling the text upward through the clipped container.
+#[derive(Component)]
+struct IntroScrollContent {
+    top: f32,
+}
+
 #[derive(Component)]
 struct PlayfieldEntity;
 
@@ -1038,7 +1072,10 @@ fn main() {
         // Intro
         .add_systems(OnEnter(GameState::Intro), setup_intro)
         .add_systems(OnExit(GameState::Intro), teardown::<IntroScreen>)
-        .add_systems(Update, advance_intro.run_if(in_state(GameState::Intro)))
+        .add_systems(
+            Update,
+            (advance_intro, update_intro_scroll).run_if(in_state(GameState::Intro)),
+        )
         // Playing
         .add_systems(OnEnter(GameState::Playing), (setup_playfield, setup_arrows))
         .add_systems(
@@ -1120,22 +1157,39 @@ fn setup_intro(mut commands: Commands) {
                 },
                 TextColor(Color::WHITE),
             ));
-            parent.spawn((
-                Text::new(
-                    "Long ago, in the Cartesian Plane, a few\n\
-                    courageous vectors sought to free themselves\n\
-                    from the domination of the Origin (0, 0).",
-                ),
-                TextFont {
-                    font_size: FontSize::Px(17.0),
+
+            // Clipped viewport for the scrolling narration.
+            parent
+                .spawn(Node {
+                    width: Val::Px(480.0),
+                    height: Val::Px(INTRO_SCROLL_HEIGHT),
+                    overflow: Overflow::clip_y(),
                     ..default()
-                },
-                TextColor(Color::srgb(0.65, 0.65, 0.78)),
-                TextLayout {
-                    justify: Justify::Center,
-                    ..default()
-                },
-            ));
+                })
+                .with_children(|parent| {
+                    parent.spawn((
+                        Text::new(INTRO_NARRATION),
+                        TextFont {
+                            font_size: FontSize::Px(15.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.65, 0.65, 0.78)),
+                        TextLayout {
+                            justify: Justify::Center,
+                            ..default()
+                        },
+                        Node {
+                            position_type: PositionType::Absolute,
+                            top: Val::Px(INTRO_SCROLL_HEIGHT),
+                            width: Val::Percent(100.0),
+                            ..default()
+                        },
+                        IntroScrollContent {
+                            top: INTRO_SCROLL_HEIGHT,
+                        },
+                    ));
+                });
+
             parent.spawn((
                 Text::new("Press any key to begin"),
                 TextFont {
@@ -1145,6 +1199,13 @@ fn setup_intro(mut commands: Commands) {
                 TextColor(Color::srgb(0.55, 0.55, 0.70)),
             ));
         });
+}
+
+fn update_intro_scroll(time: Res<Time>, mut query: Query<(&mut IntroScrollContent, &mut Node)>) {
+    for (mut scroll, mut node) in &mut query {
+        scroll.top -= INTRO_SCROLL_SPEED * time.delta_secs();
+        node.top = Val::Px(scroll.top);
+    }
 }
 
 fn advance_intro(
