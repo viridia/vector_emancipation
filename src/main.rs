@@ -3,7 +3,6 @@ use bevy::{
     prelude::*,
     render::mesh::{Indices, PrimitiveTopology},
 };
-use std::collections::VecDeque;
 use std::f32::consts::TAU;
 
 const WINDOW_SIZE: u32 = 640;
@@ -461,21 +460,72 @@ struct ArrowSpec {
     hue: f32,
 }
 
-/// Cardinal-direction unit vectors used by the BFS tail finder.
-const CARDINALS: [IVec2; 4] = [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y];
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum TurnSide {
+    Left,
+    Right,
+}
 
-/// Returns the BFS-target sampling knobs `(min_depth, bias_power)` for the
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum Action {
+    Straight,
+    TurnLeft,
+    TurnRight,
+}
+
+/// Tuning knobs for the per-step turn decisions in the random walk. The
+/// combination of these three values defines a level's visual character,
+/// ranging from Manhattan (long straight runs, no coherence) to Arabesque
+/// (short runs with strong same-side coherence producing coil-like shapes).
+#[derive(Copy, Clone, Debug)]
+struct Character {
+    /// Minimum cells the walk must extend before any turn is allowed.
+    min_run: u32,
+    /// Base per-step probability of choosing to turn once `min_run` is met.
+    p_turn: f32,
+    /// Bonus to the same-side turn weight (and matching penalty to the
+    /// opposite side) when there's a `last_turn` to match against.
+    coherence: f32,
+}
+
+/// Maps a single `style ∈ [0, 1]` to a [`Character`].
+/// `0.0` = Manhattan (long straight runs, no turn coherence);
+/// `1.0` = Arabesque (short runs, strong same-side coherence for coiling).
+fn from_style(style: f32) -> Character {
+    let s = style.clamp(0.0, 1.0);
+    Character {
+        min_run: (4.0 - 3.0 * s).round() as u32,
+        p_turn: 0.10 + 0.40 * s,
+        coherence: 0.50 * s,
+    }
+}
+
+/// During development, force a single style for every level so the
+/// algorithm can be tuned without flipping through levels. Set to `None`
+/// to enable per-level pseudo-random style selection from the level seed.
+const FIXED_STYLE: Option<f32> = Some(2.0);
+
+fn level_character(seed: u32) -> Character {
+    if let Some(s) = FIXED_STYLE {
+        from_style(s)
+    } else {
+        let h = hash_u32(seed.wrapping_add(0xC4A8AC7E));
+        from_style((h % 1000) as f32 / 1000.0)
+    }
+}
+
+/// Returns the minimum body length (in cells) required of the
 /// `placed_count`-th arrow produced by `generate_level`. The earliest
 /// placements end up being the *last* arrows the player solves (reverse-
-/// order generation), so they get the most aggressive long-tail bias —
-/// these are the sprawling "trunk" arrows. Targets relax as the board
-/// fills, so later placements settle for whatever fits in the gaps.
-fn target_constraints(placed_count: usize) -> (u16, i32) {
+/// order generation), so they get the strictest length requirement —
+/// these are the "trunk" arrows whose shape defines the level's character.
+/// Targets relax as the board fills.
+fn target_constraints(placed_count: usize) -> u16 {
     match placed_count {
-        0..=2 => (8, 4),
-        3..=6 => (4, 3),
-        7..=15 => (3, 2),
-        _ => (2, 1),
+        0..=2 => 12,
+        3..=6 => 6,
+        7..=15 => 3,
+        _ => 2,
     }
 }
 
@@ -514,6 +564,18 @@ fn in_bounds(p: IVec2, cols: i32, rows: i32) -> bool {
     p.x >= 0 && p.y >= 0 && p.x < cols && p.y < rows
 }
 
+/// Rotate a cardinal direction 90° CCW (player's left when facing `d`).
+#[inline]
+fn turn_left(d: IVec2) -> IVec2 {
+    IVec2::new(-d.y, d.x)
+}
+
+/// Rotate a cardinal direction 90° CW (player's right when facing `d`).
+#[inline]
+fn turn_right(d: IVec2) -> IVec2 {
+    IVec2::new(d.y, -d.x)
+}
+
 /// Mark every cell on the axis-aligned segment `a → b` as occupied.
 fn mark_segment_occupied(occupied: &mut [bool], cols: i32, a: IVec2, b: IVec2) {
     if a.x == b.x {
@@ -543,6 +605,7 @@ fn mark_segment_occupied(occupied: &mut [bool], cols: i32, a: IVec2, b: IVec2) {
 /// earlier-solved) arrows may cross them.
 fn generate_level(cols: i32, rows: i32, seed: u32) -> Vec<ArrowSpec> {
     let mut rng = Rng::new(seed);
+    let character = level_character(seed);
     let mut occupied = vec![false; (cols * rows) as usize];
     let mut placed: Vec<ArrowSpec> = Vec::new();
 
@@ -567,10 +630,11 @@ fn generate_level(cols: i32, rows: i32, seed: u32) -> Vec<ArrowSpec> {
     for (edge_cell, inward) in outlets {
         // Arrowhead's slide direction is outward (toward the edge cell).
         let head_dir = -inward;
-        let mut depths: Vec<i32> = (1..=max_depth).collect();
-        rng.shuffle(&mut depths);
-
-        for depth in depths {
+        // Descending depth iteration: deeper arrowheads are placed first
+        // (= solved later), so any shallower co-linear arrow placed later on
+        // this same outlet is automatically solved first — satisfying the
+        // "nearer-to-exit leaves first" rule without explicit bookkeeping.
+        for depth in (1..=max_depth).rev() {
             let arrowhead = edge_cell + inward * depth;
             if !in_bounds(arrowhead, cols, rows) {
                 continue;
@@ -599,9 +663,9 @@ fn generate_level(cols: i32, rows: i32, seed: u32) -> Vec<ArrowSpec> {
                 step += head_dir;
             }
 
-            let (min_depth, bias_power) = target_constraints(placed.len());
+            let min_length = target_constraints(placed.len());
             if let Some(verts) = try_place_arrow(
-                cols, rows, &occupied, &corridor, arrowhead, head_dir, min_depth, bias_power,
+                cols, rows, &occupied, &corridor, arrowhead, head_dir, min_length, &character,
                 &mut rng,
             ) {
                 for win in verts.windows(2) {
@@ -612,7 +676,8 @@ fn generate_level(cols: i32, rows: i32, seed: u32) -> Vec<ArrowSpec> {
                     vertices: verts,
                     hue,
                 });
-                break;
+                // No break: keep trying smaller depths on this outlet so
+                // multiple co-linear arrows can share it.
             }
         }
     }
@@ -622,13 +687,35 @@ fn generate_level(cols: i32, rows: i32, seed: u32) -> Vec<ArrowSpec> {
     placed
 }
 
-/// BFS-based tail finder. Maps reachability from `arrowhead` through free
-/// non-corridor cells (recording per-cell parent direction, depth, and
-/// running bend count), samples a target weighted toward long-and-winding
-/// paths, then traces back to assemble the arrow's vertex list.
-///
-/// Returns `Some([tail_end, …corners…, arrowhead])` on success, or `None`
-/// if no reachable cell satisfies `min_depth`.
+/// Maximum number of random-walk attempts per `(arrowhead, head_dir)`
+/// candidate. Each retry uses fresh RNG state (the shared `rng` is
+/// stateful); the longest result meeting `min_length` is kept.
+const MAX_WALK_RETRIES: usize = 8;
+
+/// Parameter `p` of the geometric distribution used to sample the head
+/// segment's target length. `P(len = k) = p * (1 - p)^(k − 1)` for
+/// `k = 1, 2, …`, so length 1 is most common (probability `p`) and longer
+/// heads decay geometrically. Mean head length ≈ `1 / p`. Independent of
+/// `Character`; the head's shape is intentionally not tied to the level's
+/// overall winding character. The distribution is *truncated* per walk to
+/// `[1, max_straight]` so achievable head lengths are sampled rather than
+/// silently clamping every too-long sample to `max_straight`.
+const HEAD_GEOMETRIC_P: f32 = 0.15;
+
+/// Reject a walk candidate if its arrowhead can extend straight by fewer
+/// than this many cells. Below this threshold the head is locked at 1
+/// regardless of what's sampled, which would dominate the observed head
+/// distribution (every cramped filler would contribute another length-1).
+const MIN_HEAD_ROOM: u32 = 2;
+
+/// Random-walk tail finder. From `arrowhead`, takes a forced first step
+/// opposite `head_dir`, then walks outward by sampling per-step actions
+/// {Straight, TurnLeft, TurnRight} weighted by `character` knobs plus
+/// per-step state (`steps_since_turn`, `last_turn`). Up to
+/// `MAX_WALK_RETRIES` walks are run; the longest meeting `min_length` is
+/// returned as `[tail_end, …corners…, arrowhead]`. Returns `None` if every
+/// retry fails (e.g., the forced first step is blocked) or no retry meets
+/// the length threshold.
 fn try_place_arrow(
     cols: i32,
     rows: i32,
@@ -636,18 +723,67 @@ fn try_place_arrow(
     corridor: &[bool],
     arrowhead: IVec2,
     head_dir: IVec2,
-    min_depth: u16,
-    bias_power: i32,
+    min_length: u16,
+    character: &Character,
+    rng: &mut Rng,
+) -> Option<Vec<IVec2>> {
+    let mut best: Option<Vec<IVec2>> = None;
+    for _ in 0..MAX_WALK_RETRIES {
+        let Some(path) = walk_once(
+            cols, rows, occupied, corridor, arrowhead, head_dir, character, rng,
+        ) else {
+            // `walk_once` only fails for invariants that don't depend on
+            // RNG state (e.g., forced first step OOB), so retrying after a
+            // hard failure is pointless. Bail out of the retry loop.
+            return None;
+        };
+        if path.len() < min_length as usize {
+            continue;
+        }
+        match &best {
+            Some(b) if b.len() >= path.len() => {}
+            _ => best = Some(path),
+        }
+    }
+    best.map(|p| collapse_to_vertices(&p))
+}
+
+/// Runs a single random walk attempt starting at `arrowhead`. Returns the
+/// full cell path `[arrowhead, first, …, tail_end]` (always length ≥ 2 on
+/// success), or `None` if the forced first step is invalid.
+///
+/// The walk has three regimes:
+/// 1. **Head segment** — the walk is forced straight until the per-walk
+///    sampled `head_target` length is laid down; then it is forced to
+///    turn (or, if both turns are blocked, allowed to extend straight
+///    rather than stopping a long-trunk arrow). The head's length is
+///    sampled from a geometric distribution (parameter `HEAD_GEOMETRIC_P`)
+///    independent of `character`.
+/// 2. **Post-turn min-run gate** — once the first turn has been taken,
+///    each subsequent segment is forced straight for at least
+///    `character.min_run` cells before turning is re-allowed.
+/// 3. **Normal weighted sampling** — beyond the min-run gate, the three
+///    actions are weighted by `character.p_turn` and the coherence bonus
+///    derived from `last_turn`.
+///
+/// In every regime, an invalid forced direction falls back to a turn
+/// (force-turn fallback) so the walk can navigate around obstacles.
+fn walk_once(
+    cols: i32,
+    rows: i32,
+    occupied: &[bool],
+    corridor: &[bool],
+    arrowhead: IVec2,
+    head_dir: IVec2,
+    character: &Character,
     rng: &mut Rng,
 ) -> Option<Vec<IVec2>> {
     let n = (cols * rows) as usize;
-    // (parent_dir, depth, bends_to_here). `parent_dir` points from this
-    // cell to its parent — trace back via `cur += parent_dir`.
-    let mut visited: Vec<Option<(IVec2, u16, u16)>> = vec![None; n];
-    visited[cell_index(arrowhead, cols)] = Some((IVec2::ZERO, 0, 0));
+    let mut visited = vec![false; n];
+    visited[cell_index(arrowhead, cols)] = true;
 
-    // Force the first step opposite `head_dir` so the arrowhead's final
-    // segment matches the slide direction.
+    // Forced first step opposite `head_dir` so the arrow's last segment
+    // matches the slide direction.
     let first = arrowhead - head_dir;
     if !in_bounds(first, cols, rows) {
         return None;
@@ -656,89 +792,188 @@ fn try_place_arrow(
     if occupied[i_first] || corridor[i_first] {
         return None;
     }
-    visited[i_first] = Some((head_dir, 1, 0));
+    visited[i_first] = true;
 
-    let mut frontier: VecDeque<IVec2> = VecDeque::new();
-    frontier.push_back(first);
-
-    while let Some(cell) = frontier.pop_front() {
-        let (parent_dir, depth, bends) = visited[cell_index(cell, cols)].unwrap();
-        // The direction we were moving when we arrived at `cell`.
-        let incoming = -parent_dir;
-        let mut dirs = CARDINALS;
-        rng.shuffle(&mut dirs);
-        for d in dirs {
-            let next = cell + d;
-            if !in_bounds(next, cols, rows) {
-                continue;
-            }
-            let i = cell_index(next, cols);
-            if visited[i].is_some() || occupied[i] || corridor[i] {
-                continue;
-            }
-            let bend_inc: u16 = if d != incoming { 1 } else { 0 };
-            visited[i] = Some((-d, depth + 1, bends + bend_inc));
-            frontier.push_back(next);
-        }
-    }
-
-    // Weighted target sampling: weight = depth^bias_power × (1 + bends).
-    let mut weights: Vec<(IVec2, f32)> = Vec::new();
-    let mut total: f32 = 0.0;
-    for r in 0..rows {
-        for c in 0..cols {
-            let p = IVec2::new(c, r);
-            if let Some((_, depth, bends)) = visited[cell_index(p, cols)]
-                && depth >= min_depth
-            {
-                let w = (depth as f32).powi(bias_power) * (1.0 + bends as f32);
-                total += w;
-                weights.push((p, w));
-            }
-        }
-    }
-    if weights.is_empty() {
-        return None;
-    }
-    let mut pick = rng.f32_unit() * total;
-    let mut target = weights[0].0;
-    for (p, w) in &weights {
-        if pick <= *w {
-            target = *p;
+    // Probe how far the walk could continue straight from the arrowhead
+    // in `-head_dir` (counting the already-forced `first` cell). This caps
+    // the head's achievable length; sampling head_target without knowing
+    // this would make most fillers collapse to head=1 (every too-long
+    // sample silently clipping), which is exactly the bias we're trying
+    // to eliminate.
+    let mut max_straight: u32 = 1; // `first` already accounts for one cell
+    let mut probe = first - head_dir;
+    while in_bounds(probe, cols, rows) {
+        let i = cell_index(probe, cols);
+        if occupied[i] || corridor[i] {
             break;
         }
-        pick -= *w;
+        max_straight += 1;
+        probe -= head_dir;
+    }
+    if max_straight < MIN_HEAD_ROOM {
+        return None;
     }
 
-    // Trace back from target to arrowhead via parent_dir.
-    let mut path: Vec<IVec2> = vec![target];
-    let mut cur = target;
+    // Sample head_target from the geometric distribution *truncated and
+    // re-normalized* over `[1, max_straight]`. Without truncation, every
+    // too-long sample would silently clip to max_straight, piling
+    // probability there; truncation spreads probability across achievable
+    // values so cramped walks still produce a range of head lengths.
+    let p_max = 1.0 - (1.0 - HEAD_GEOMETRIC_P).powi(max_straight as i32);
+    let u = (rng.f32_unit() * p_max).clamp(1e-7, 1.0 - 1e-7);
+    let head_target = (((1.0 - u).ln() / (1.0 - HEAD_GEOMETRIC_P).ln()).ceil() as u32)
+        .max(1)
+        .min(max_straight);
+    let mut head_remaining: u32 = head_target.saturating_sub(1);
+
+    let mut path = vec![arrowhead, first];
+    let mut dir = -head_dir;
+    let mut steps_since_turn: u32 = 1;
+    let mut last_turn: Option<TurnSide> = None;
+    let mut past_first_turn = false;
+
     loop {
-        let (parent_dir, depth, _) = visited[cell_index(cur, cols)].unwrap();
-        if depth == 0 {
+        let cur = *path.last().unwrap();
+        let straight_dir = dir;
+        let left_dir = turn_left(dir);
+        let right_dir = turn_right(dir);
+
+        let straight_valid =
+            is_walkable(cur + straight_dir, cols, rows, occupied, corridor, &visited);
+        let left_valid = is_walkable(cur + left_dir, cols, rows, occupied, corridor, &visited);
+        let right_valid = is_walkable(cur + right_dir, cols, rows, occupied, corridor, &visited);
+
+        let half_turn = character.p_turn * 0.5;
+        let (bonus_left, bonus_right) = match last_turn {
+            Some(TurnSide::Left) => (
+                character.coherence * half_turn,
+                -character.coherence * half_turn,
+            ),
+            Some(TurnSide::Right) => (
+                -character.coherence * half_turn,
+                character.coherence * half_turn,
+            ),
+            None => (0.0, 0.0),
+        };
+        let turn_weight_left = if left_valid {
+            (half_turn + bonus_left).max(0.0)
+        } else {
+            0.0
+        };
+        let turn_weight_right = if right_valid {
+            (half_turn + bonus_right).max(0.0)
+        } else {
+            0.0
+        };
+
+        let (w_straight, w_left, w_right) = if !past_first_turn && head_remaining > 0 {
+            // Inside head segment: force straight, fall back to a turn if blocked.
+            if straight_valid {
+                (1.0, 0.0, 0.0)
+            } else {
+                (0.0, turn_weight_left, turn_weight_right)
+            }
+        } else if !past_first_turn {
+            // Head target reached: force a turn. Fall back to straight only
+            // if both turns are blocked, so the arrow can keep extending
+            // rather than stopping just because the corner is wedged.
+            if turn_weight_left + turn_weight_right > 0.0 {
+                (0.0, turn_weight_left, turn_weight_right)
+            } else if straight_valid {
+                (1.0, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        } else if steps_since_turn < character.min_run {
+            // Post-head min-run gate: force straight, fall back to a turn if blocked.
+            if straight_valid {
+                (1.0, 0.0, 0.0)
+            } else {
+                (0.0, turn_weight_left, turn_weight_right)
+            }
+        } else {
+            // Normal weighted sampling.
+            let s = if straight_valid {
+                1.0 - character.p_turn
+            } else {
+                0.0
+            };
+            (s, turn_weight_left, turn_weight_right)
+        };
+
+        let total = w_straight + w_left + w_right;
+        if total <= 0.0 {
             break;
         }
-        cur += parent_dir;
-        path.push(cur);
-    }
-    let n_path = path.len();
-    if n_path < 2 {
-        return None;
+
+        let mut pick = rng.f32_unit() * total;
+        let action = if pick < w_straight {
+            Action::Straight
+        } else {
+            pick -= w_straight;
+            if pick < w_left {
+                Action::TurnLeft
+            } else {
+                Action::TurnRight
+            }
+        };
+
+        let (next_pos, new_dir, taken_turn) = match action {
+            Action::Straight => (cur + straight_dir, straight_dir, None),
+            Action::TurnLeft => (cur + left_dir, left_dir, Some(TurnSide::Left)),
+            Action::TurnRight => (cur + right_dir, right_dir, Some(TurnSide::Right)),
+        };
+
+        visited[cell_index(next_pos, cols)] = true;
+        path.push(next_pos);
+        dir = new_dir;
+        if let Some(side) = taken_turn {
+            past_first_turn = true;
+            steps_since_turn = 0;
+            last_turn = Some(side);
+        } else {
+            steps_since_turn += 1;
+            if !past_first_turn {
+                head_remaining = head_remaining.saturating_sub(1);
+            }
+        }
     }
 
-    // Collapse collinear runs into vertices. `path[0]` is the tail end and
-    // `path[n_path - 1]` is the arrowhead.
-    let mut vertices: Vec<IVec2> = Vec::with_capacity(n_path);
-    vertices.push(path[0]);
-    for i in 1..n_path - 1 {
+    Some(path)
+}
+
+#[inline]
+fn is_walkable(
+    p: IVec2,
+    cols: i32,
+    rows: i32,
+    occupied: &[bool],
+    corridor: &[bool],
+    visited: &[bool],
+) -> bool {
+    if !in_bounds(p, cols, rows) {
+        return false;
+    }
+    let i = cell_index(p, cols);
+    !occupied[i] && !corridor[i] && !visited[i]
+}
+
+/// Convert a walk path `[arrowhead, …, tail_end]` into the vertex list
+/// expected by `Arrow`: `[tail_end, …corners…, arrowhead]`. Collinear runs
+/// in the path collapse into a single segment.
+fn collapse_to_vertices(path: &[IVec2]) -> Vec<IVec2> {
+    let mut vertices: Vec<IVec2> = Vec::with_capacity(path.len());
+    vertices.push(path[0]); // arrowhead
+    for i in 1..path.len() - 1 {
         let prev_dir = path[i] - path[i - 1];
         let next_dir = path[i + 1] - path[i];
         if prev_dir != next_dir {
             vertices.push(path[i]);
         }
     }
-    vertices.push(path[n_path - 1]);
-    Some(vertices)
+    vertices.push(*path.last().unwrap()); // tail_end
+    vertices.reverse();
+    vertices
 }
 
 // ── Marker components (used for state-scoped entity cleanup) ─────────────────
