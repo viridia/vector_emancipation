@@ -375,9 +375,7 @@ fn build_arrow_mesh(
     // Include original vertices between tail_seg+1 and nb-2 (nb-1 is replaced
     // by head so the arrowhead always follows the extended tip).
     let mut wps: Vec<Vec2> = vec![tail_pos];
-    for i in (tail_seg + 1)..(nb - 1) {
-        wps.push(base[i]);
-    }
+    wps.extend(base.iter().take(nb - 1).skip(tail_seg + 1).copied());
     wps.push(head);
 
     let n = wps.len();
