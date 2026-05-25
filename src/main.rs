@@ -37,6 +37,11 @@ enum GameState {
 #[derive(Resource, Default)]
 struct LevelIndex(u32);
 
+/// Tracks the highest level number the player has completed (1-based display).
+/// Zero means no level has been completed yet.
+#[derive(Resource, Default)]
+struct HighestLevel(u32);
+
 /// Returns the `(cols, rows)` grid dimensions for a given level index.
 /// Deterministic but pseudo-random: derived from a hash of the level number.
 fn level_grid_size(level: u32) -> (i32, i32) {
@@ -515,11 +520,11 @@ fn generate_level(cols: i32, rows: i32, seed: u32) -> Vec<ArrowSpec> {
     // it touches. Corner cells contribute two outlets (one per adjacent edge).
     let mut outlets: Vec<(IVec2, IVec2)> = Vec::new();
     for c in 0..cols {
-        outlets.push((IVec2::new(c, 0), IVec2::Y));            // bottom edge → inward = up
+        outlets.push((IVec2::new(c, 0), IVec2::Y)); // bottom edge → inward = up
         outlets.push((IVec2::new(c, rows - 1), IVec2::NEG_Y)); // top edge → inward = down
     }
     for r in 0..rows {
-        outlets.push((IVec2::new(0, r), IVec2::X));            // left edge → inward = right
+        outlets.push((IVec2::new(0, r), IVec2::X)); // left edge → inward = right
         outlets.push((IVec2::new(cols - 1, r), IVec2::NEG_X)); // right edge → inward = left
     }
     rng.shuffle(&mut outlets);
@@ -559,14 +564,17 @@ fn generate_level(cols: i32, rows: i32, seed: u32) -> Vec<ArrowSpec> {
                 step += head_dir;
             }
 
-            if let Some(verts) =
-                try_place_arrow(cols, rows, &occupied, &corridor, arrowhead, head_dir, &mut rng)
-            {
+            if let Some(verts) = try_place_arrow(
+                cols, rows, &occupied, &corridor, arrowhead, head_dir, &mut rng,
+            ) {
                 for win in verts.windows(2) {
                     mark_segment_occupied(&mut occupied, cols, win[0], win[1]);
                 }
                 let hue = rng.f32_unit() * 360.0;
-                placed.push(ArrowSpec { vertices: verts, hue });
+                placed.push(ArrowSpec {
+                    vertices: verts,
+                    hue,
+                });
                 break;
             }
         }
@@ -623,7 +631,11 @@ fn try_place_arrow(
         if steps < target {
             break; // segment cut short — accept what we have, don't continue
         }
-        dir = if rng.bool() { turn_left(dir) } else { turn_right(dir) };
+        dir = if rng.bool() {
+            turn_left(dir)
+        } else {
+            turn_right(dir)
+        };
     }
 
     if segment_ends.is_empty() {
@@ -670,6 +682,7 @@ fn main() {
         })
         .init_state::<GameState>()
         .init_resource::<LevelIndex>()
+        .init_resource::<HighestLevel>()
         .init_resource::<HoveredArrow>()
         .init_resource::<HoveredCell>()
         .add_systems(Startup, setup_camera)
@@ -703,6 +716,10 @@ fn main() {
         .add_systems(
             OnExit(GameState::PuzzleComplete),
             teardown::<PuzzleCompleteScreen>,
+        )
+        .add_systems(
+            Update,
+            advance_puzzle_complete.run_if(in_state(GameState::PuzzleComplete)),
         )
         .run();
 }
@@ -1090,7 +1107,15 @@ fn update_dot_scales(hovered_cell: Res<HoveredCell>, mut dot_q: Query<(&GridDot,
 
 // ── Puzzle complete ───────────────────────────────────────────────────────────
 
-fn setup_puzzle_complete(mut commands: Commands) {
+fn setup_puzzle_complete(
+    mut commands: Commands,
+    level: Res<LevelIndex>,
+    mut highest: ResMut<HighestLevel>,
+) {
+    // Record highest completed level (level.0 is 0-indexed, so +1 for display).
+    highest.0 = highest.0.max(level.0 + 1);
+    let highest_text = format!("Highest level: {}", highest.0);
+
     commands
         .spawn((
             Node {
@@ -1114,6 +1139,14 @@ fn setup_puzzle_complete(mut commands: Commands) {
                 TextColor(Color::WHITE),
             ));
             parent.spawn((
+                Text::new(highest_text),
+                TextFont {
+                    font_size: FontSize::Px(24.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.65, 0.80, 0.65)),
+            ));
+            parent.spawn((
                 Text::new("Press any key to continue"),
                 TextFont {
                     font_size: FontSize::Px(22.0),
@@ -1122,4 +1155,17 @@ fn setup_puzzle_complete(mut commands: Commands) {
                 TextColor(Color::srgb(0.55, 0.55, 0.70)),
             ));
         });
+}
+
+/// Advances to the next level when the player presses a key or clicks.
+fn advance_puzzle_complete(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut level: ResMut<LevelIndex>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    if keyboard.get_just_pressed().next().is_some() || mouse.get_just_pressed().next().is_some() {
+        level.0 += 1;
+        next_state.set(GameState::Playing);
+    }
 }
