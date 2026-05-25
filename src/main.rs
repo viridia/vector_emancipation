@@ -1,3 +1,27 @@
+//! Vector Emancipation — an "arrow escape" puzzle.
+//!
+//! The board is a grid populated with axis-aligned arrows. Each arrow's
+//! arrowhead points toward one edge of the board; the straight line of
+//! cells from the arrowhead to that edge is its **corridor** — its exit
+//! lane.
+//!
+//! Clicking an arrow attempts to launch it: the arrow slides forward
+//! along its corridor while the tail is trimmed at the same speed, so
+//! its visible body stays a constant length until the whole arrow has
+//! slid off-screen. An arrow can only launch if its corridor is
+//! currently unobstructed by any other arrow's body; clicking a blocked
+//! arrow makes it nudge forward and bounce back to its starting position
+//! instead.
+//!
+//! The puzzle is to find an order in which every arrow can be cleared.
+//! Arrows' bodies sit across each other's corridors, so each successful
+//! launch unblocks one or more arrows that were previously stuck. The
+//! level is won when every arrow has slid off the board.
+//!
+//! Levels are procedurally generated and deterministic in the level
+//! number: the same level number always produces the same arrangement.
+//! See the *Level generation* section for the algorithm.
+
 use bevy::{
     asset::RenderAssetUsages,
     prelude::*,
